@@ -5,7 +5,8 @@ A high-performance, crash-resilient, embedded **Log-Structured Merge-Tree (LSM-T
 > 📚 **Technical Documentation**:
 > * 📐 [Architecture, Disk Formats & Concurrency (`ARCHITECTURE.md`)](ARCHITECTURE.md)
 > * 🚀 [Implementation Phases & Engineering Milestones (`PHASES.md`)](PHASES.md)
-> * 🎯 [Staff Systems Engineering Interview Preparation (`INTERVIEW_PREP.md`)](INTERVIEW_PREP.md)
+> * 🎯 [Deep-Dive Staff Systems Interview Guide (`INTERVIEW_PREP.md`)](INTERVIEW_PREP.md)
+> * 🗣️ [Conversational & Practical Interview Stories (`PRACTICAL_INTERVIEW_PREP.md`)](PRACTICAL_INTERVIEW_PREP.md)
 
 ---
 
