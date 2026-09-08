@@ -1,9 +1,12 @@
 pub mod compaction;
 pub mod error;
 pub mod filter;
+pub mod iterator;
 pub mod memtable;
 pub mod sstable;
 pub mod wal;
+
+pub use iterator::MergeIterator;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,10 +18,11 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::error::Result;
 use crate::memtable::MemTable;
-use crate::sstable::{SsTableBuilder, SsTableReader};
+use crate::sstable::{BlockCache, SsTableBuilder, SsTableReader};
 use crate::wal::{WalOp, WalReader, WalWriter};
 
 pub const DEFAULT_MAX_MEMTABLE_SIZE: usize = 4 * 1024 * 1024; // 4MB
+pub const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 1024; // 1,024 blocks = ~4MB
 
 pub struct LsmEngine {
     dir: PathBuf,
@@ -26,20 +30,32 @@ pub struct LsmEngine {
     imm_memtables: RwLock<Vec<Arc<MemTable>>>,
     sstables: RwLock<Vec<SsTableReader>>, // Ordered from newest (idx 0) to oldest
     wal_writer: Mutex<WalWriter>,
+    block_cache: Arc<Mutex<BlockCache>>,
     next_sst_id: AtomicU64,
     max_memtable_size: usize,
 }
 
 impl LsmEngine {
-    /// Opens an LSM storage engine at the specified directory with default 4MB memtable threshold.
+    /// Opens an LSM storage engine at the specified directory with default 4MB memtable threshold and 4MB block cache.
     pub fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
-        Self::open_with_options(dir, DEFAULT_MAX_MEMTABLE_SIZE)
+        Self::open_with_cache_options(dir, DEFAULT_MAX_MEMTABLE_SIZE, DEFAULT_BLOCK_CACHE_CAPACITY)
     }
 
     /// Opens an LSM storage engine with custom memtable size threshold.
     pub fn open_with_options<P: AsRef<Path>>(dir: P, max_memtable_size: usize) -> Result<Self> {
+        Self::open_with_cache_options(dir, max_memtable_size, DEFAULT_BLOCK_CACHE_CAPACITY)
+    }
+
+    /// Opens an LSM storage engine with custom memtable and block cache capacities.
+    pub fn open_with_cache_options<P: AsRef<Path>>(
+        dir: P,
+        max_memtable_size: usize,
+        block_cache_capacity: usize,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+
+        let block_cache = Arc::new(Mutex::new(BlockCache::new(block_cache_capacity)));
 
         // 1. Discover and load existing SSTables (.sst files)
         let mut sst_files = Vec::new();
@@ -62,7 +78,7 @@ impl LsmEngine {
         sst_files.sort_by(|a, b| b.0.cmp(&a.0));
         let mut sstables = Vec::with_capacity(sst_files.len());
         for (_, path) in sst_files {
-            sstables.push(SsTableReader::open(&path)?);
+            sstables.push(SsTableReader::open_with_cache(&path, Some(Arc::clone(&block_cache)))?);
         }
 
         // 2. Recover active MemTable from WAL
@@ -93,6 +109,7 @@ impl LsmEngine {
             imm_memtables: RwLock::new(Vec::new()),
             sstables: RwLock::new(sstables),
             wal_writer,
+            block_cache,
             next_sst_id: AtomicU64::new(max_id + 1),
             max_memtable_size,
         })
@@ -201,8 +218,8 @@ impl LsmEngine {
         }
         builder.finish()?;
 
-        // 4. Open reader and register as newest SSTable
-        let reader = SsTableReader::open(&sst_path)?;
+        // 4. Open reader with shared block cache and register as newest SSTable
+        let reader = SsTableReader::open_with_cache(&sst_path, Some(Arc::clone(&self.block_cache)))?;
         self.sstables.write().insert(0, reader);
 
         // 5. Remove from immutable queue and cycle WAL
@@ -226,6 +243,16 @@ impl LsmEngine {
         self.memtable.read().size_bytes()
     }
 
+    /// Number of 4KB data blocks currently resident in the LRU block cache.
+    pub fn block_cache_len(&self) -> usize {
+        self.block_cache.lock().len()
+    }
+
+    /// Maximum number of blocks the LRU block cache can hold.
+    pub fn block_cache_capacity(&self) -> usize {
+        self.block_cache.lock().capacity()
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -246,10 +273,80 @@ impl LsmEngine {
             true, // Bottom level: safe to evict tombstones
         )?;
 
-        let compacted_reader = SsTableReader::open(&new_path)?;
+        let compacted_reader = SsTableReader::open_with_cache(&new_path, Some(Arc::clone(&self.block_cache)))?;
         *sstables_guard = vec![compacted_reader];
 
         Ok(())
+    }
+
+    /// Performs a range scan over [start, end) or unbounded bounds.
+    /// Merges entries from MemTable, frozen MemTables, and on-disk SSTables in sorted order.
+    /// Deduplicates keys, keeps newest revisions, and automatically prunes deleted keys.
+    pub fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<Vec<(Bytes, Bytes)>> {
+        let mut iterators: Vec<Box<dyn Iterator<Item = Result<(Bytes, Option<Bytes>)>>>> = Vec::new();
+
+        // 1. Active mutable MemTable (Priority 0 - Freshest)
+        {
+            let memtable = self.memtable.read().clone();
+            let entries = memtable
+                .iter()
+                .filter_map(|(k, v)| {
+                    if let Some(s) = start {
+                        if k.as_ref() < s {
+                            return None;
+                        }
+                    }
+                    if let Some(e) = end {
+                        if k.as_ref() >= e {
+                            return None;
+                        }
+                    }
+                    Some(Ok((k, v)))
+                })
+                .collect::<Vec<_>>();
+            iterators.push(Box::new(entries.into_iter()));
+        }
+
+        // 2. Immutable MemTables (Priority 1..K)
+        {
+            let imm_tables = self.imm_memtables.read().clone();
+            for imm in imm_tables.iter().rev() {
+                let entries = imm
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if let Some(s) = start {
+                            if k.as_ref() < s {
+                                return None;
+                            }
+                        }
+                        if let Some(e) = end {
+                            if k.as_ref() >= e {
+                                return None;
+                            }
+                        }
+                        Some(Ok((k, v)))
+                    })
+                    .collect::<Vec<_>>();
+                iterators.push(Box::new(entries.into_iter()));
+            }
+        }
+
+        // 3. SSTables from newest to oldest
+        {
+            let sstables = self.sstables.read();
+            for sstable in sstables.iter() {
+                let sst_iter = sstable.iter_range(start, end)?;
+                iterators.push(Box::new(sst_iter));
+            }
+        }
+
+        let merge_iter = MergeIterator::new(iterators);
+        merge_iter.collect()
+    }
+
+    /// Convenience method to scan all active key-value pairs across the entire engine.
+    pub fn scan_all(&self) -> Result<Vec<(Bytes, Bytes)>> {
+        self.scan(None, None)
     }
 }
 
@@ -362,6 +459,76 @@ mod tests {
         assert_eq!(db.get(b"k1")?, Some(Bytes::from("v1_new")));
         assert_eq!(db.get(b"k2")?, None); // Purged
         assert_eq!(db.get(b"k3")?, Some(Bytes::from("v3")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_engine_range_scan() -> Result<()> {
+        let temp = tempdir()?;
+        let db = LsmEngine::open_with_options(temp.path(), 512)?;
+
+        // Batch 1: Insert into SSTable 1 (via flush)
+        db.put(b"user:010", b"Alice")?;
+        db.put(b"user:020", b"Bob")?;
+        db.put(b"user:030", b"Charlie")?;
+        db.flush_memtable()?;
+
+        // Batch 2: Insert into SSTable 2 (via flush)
+        db.put(b"user:015", b"Alex")?;
+        db.put(b"user:020", b"BobUpdated")?; // Overwrite
+        db.put(b"user:040", b"Dave")?;
+        db.flush_memtable()?;
+
+        // Batch 3: Active MemTable (in-memory)
+        db.put(b"user:025", b"Brian")?;
+        db.delete(b"user:030")?; // Delete Charlie in MemTable
+        db.put(b"user:050", b"Eve")?;
+
+        // 1. Scan bounded range: [user:015, user:035)
+        let results = db.scan(Some(b"user:015"), Some(b"user:035"))?;
+        // Expected:
+        // user:015 -> Alex
+        // user:020 -> BobUpdated (from SSTable 2, masking SSTable 1's Bob)
+        // user:025 -> Brian (from MemTable)
+        // user:030 -> deleted (tombstone in MemTable masks Charlie)
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], (Bytes::from("user:015"), Bytes::from("Alex")));
+        assert_eq!(results[1], (Bytes::from("user:020"), Bytes::from("BobUpdated")));
+        assert_eq!(results[2], (Bytes::from("user:025"), Bytes::from("Brian")));
+
+        // 2. Scan all
+        let all = db.scan_all()?;
+        // Expected: user:010, user:015, user:020, user:025, user:040, user:050
+        assert_eq!(all.len(), 6);
+        assert_eq!(all[0].0.as_ref(), b"user:010");
+        assert_eq!(all[5].0.as_ref(), b"user:050");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_engine_block_cache() -> Result<()> {
+        let temp = tempdir()?;
+        // DB with tiny 2-block LRU cache
+        let db = LsmEngine::open_with_cache_options(temp.path(), 512, 2)?;
+        assert_eq!(db.block_cache_capacity(), 2);
+        assert_eq!(db.block_cache_len(), 0);
+
+        // Put keys and flush to SSTable
+        for i in 0..30 {
+            let k = format!("cached_key_{:03}", i);
+            let v = format!("cached_val_{:03}", i);
+            db.put(k.as_bytes(), v.as_bytes())?;
+        }
+        db.flush_memtable()?;
+
+        // Cold read: loads block into cache
+        assert_eq!(db.get(b"cached_key_005")?, Some(Bytes::from("cached_val_005")));
+        assert!(db.block_cache_len() >= 1);
+
+        // Warm read: serves directly from block cache
+        assert_eq!(db.get(b"cached_key_005")?, Some(Bytes::from("cached_val_005")));
 
         Ok(())
     }

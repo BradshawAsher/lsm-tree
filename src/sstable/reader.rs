@@ -1,24 +1,42 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
+use parking_lot::Mutex;
 
 use crate::error::{LsmError, Result};
 use crate::filter::BloomFilter;
 use crate::sstable::block::Block;
 use crate::sstable::builder::{BlockMeta, FOOTER_SIZE, SSTABLE_MAGIC};
+use crate::sstable::cache::{BlockCache, BlockKey};
 
 pub struct SsTableReader {
     path: PathBuf,
     file: File,
     block_metas: Vec<BlockMeta>,
     bloom_filter: BloomFilter,
+    sst_id: u64,
+    block_cache: Option<Arc<Mutex<BlockCache>>>,
 }
 
 impl SsTableReader {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_cache(path, None)
+    }
+
+    pub fn open_with_cache<P: AsRef<Path>>(
+        path: P,
+        block_cache: Option<Arc<Mutex<BlockCache>>>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let sst_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
         let mut file = OpenOptions::new().read(true).open(&path)?;
         let file_len = file.metadata()?.len();
 
@@ -79,7 +97,35 @@ impl SsTableReader {
             file,
             block_metas,
             bloom_filter,
+            sst_id,
+            block_cache,
         })
+    }
+
+    /// Reads and decodes a data block, leveraging the in-memory LRU block cache if available.
+    pub fn read_block(&mut self, block_idx: usize) -> Result<Arc<Block>> {
+        let meta = &self.block_metas[block_idx];
+        let cache_key = BlockKey {
+            sst_id: self.sst_id,
+            offset: meta.offset,
+        };
+
+        if let Some(cache) = &self.block_cache {
+            if let Some(block) = cache.lock().get(&cache_key) {
+                return Ok(block);
+            }
+        }
+
+        self.file.seek(SeekFrom::Start(meta.offset))?;
+        let mut block_buf = vec![0u8; meta.len as usize];
+        self.file.read_exact(&mut block_buf)?;
+        let block = Arc::new(Block::decode(Bytes::from(block_buf))?);
+
+        if let Some(cache) = &self.block_cache {
+            cache.lock().insert(cache_key, block.clone());
+        }
+
+        Ok(block)
     }
 
     /// Point lookup for a key in this SSTable.
@@ -116,32 +162,21 @@ impl SsTableReader {
             }
         };
 
-        let meta = &self.block_metas[idx];
-
-        // Step 4: Seek and read only that single block from disk
-        self.file.seek(SeekFrom::Start(meta.offset))?;
-        let mut block_buf = vec![0u8; meta.len as usize];
-        self.file.read_exact(&mut block_buf)?;
+        // Step 4: Fetch block (from LRU block cache or disk)
+        let block = self.read_block(idx)?;
 
         // Step 5: Binary search within the decoded block
-        let block = Block::decode(Bytes::from(block_buf))?;
         Ok(block.get(key))
     }
 
     /// Reads all entries from all data blocks in sequential order.
     pub fn read_all_entries(&mut self) -> Result<Vec<(Bytes, Option<Bytes>)>> {
         let mut entries = Vec::new();
-        for meta in &self.block_metas {
-            self.file.seek(SeekFrom::Start(meta.offset))?;
-            let mut buf = vec![0u8; meta.len as usize];
-            self.file.read_exact(&mut buf)?;
-            let block = Block::decode(Bytes::from(buf))?;
-
-            for i in 0..block.len() {
-                if let Some(k) = block.get_key(i) {
-                    if let Some(val_opt) = block.get(&k) {
-                        entries.push((k, val_opt));
-                    }
+        for i in 0..self.block_metas.len() {
+            let block = self.read_block(i)?;
+            for j in 0..block.len() {
+                if let Some(entry) = block.get_entry(j) {
+                    entries.push(entry);
                 }
             }
         }
@@ -154,6 +189,193 @@ impl SsTableReader {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn sst_id(&self) -> u64 {
+        self.sst_id
+    }
+
+    /// Sets or updates the block cache for this reader.
+    pub fn set_cache(&mut self, cache: Arc<Mutex<BlockCache>>) {
+        self.block_cache = Some(cache);
+    }
+
+    /// Creates an iterator over this SSTable within [start, end).
+    pub fn iter_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<SsTableIterator> {
+        SsTableIterator::new_with_cache(
+            &self.path,
+            self.sst_id,
+            self.block_metas.clone(),
+            start,
+            end,
+            self.block_cache.clone(),
+        )
+    }
+
+    /// Creates an iterator over all entries in this SSTable.
+    pub fn iter(&self) -> Result<SsTableIterator> {
+        self.iter_range(None, None)
+    }
+}
+
+/// Sequential, on-demand block iterator over an SSTable.
+pub struct SsTableIterator {
+    file: File,
+    sst_id: u64,
+    block_metas: Vec<BlockMeta>,
+    current_block_idx: usize,
+    current_block: Option<Arc<Block>>,
+    current_entry_idx: usize,
+    end_bound: Option<Bytes>,
+    block_cache: Option<Arc<Mutex<BlockCache>>>,
+}
+
+impl SsTableIterator {
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        block_metas: Vec<BlockMeta>,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Self> {
+        Self::new_with_cache(path, 0, block_metas, start, end, None)
+    }
+
+    pub fn new_with_cache<P: AsRef<Path>>(
+        path: P,
+        sst_id: u64,
+        block_metas: Vec<BlockMeta>,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        block_cache: Option<Arc<Mutex<BlockCache>>>,
+    ) -> Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        if block_metas.is_empty() {
+            return Ok(Self {
+                file,
+                sst_id,
+                block_metas,
+                current_block_idx: 0,
+                current_block: None,
+                current_entry_idx: 0,
+                end_bound: None,
+                block_cache,
+            });
+        }
+
+        let start_block_idx = match start {
+            None => 0,
+            Some(s) => {
+                if s < block_metas[0].first_key.as_ref() {
+                    0
+                } else {
+                    match block_metas.binary_search_by(|b| b.first_key.as_ref().cmp(s)) {
+                        Ok(exact) => exact,
+                        Err(ins) => {
+                            if ins == 0 {
+                                0
+                            } else {
+                                ins - 1
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let mut iter = Self {
+            file,
+            sst_id,
+            block_metas,
+            current_block_idx: start_block_idx,
+            current_block: None,
+            current_entry_idx: 0,
+            end_bound: end.map(Bytes::copy_from_slice),
+            block_cache,
+        };
+
+        iter.load_block_and_seek(start_block_idx, start)?;
+        Ok(iter)
+    }
+
+    fn load_block_and_seek(&mut self, block_idx: usize, seek_key: Option<&[u8]>) -> Result<()> {
+        if block_idx >= self.block_metas.len() {
+            self.current_block = None;
+            return Ok(());
+        }
+
+        let meta = &self.block_metas[block_idx];
+        let cache_key = BlockKey {
+            sst_id: self.sst_id,
+            offset: meta.offset,
+        };
+
+        let block = if let Some(cache) = &self.block_cache {
+            if let Some(b) = cache.lock().get(&cache_key) {
+                b
+            } else {
+                self.file.seek(SeekFrom::Start(meta.offset))?;
+                let mut buf = vec![0u8; meta.len as usize];
+                self.file.read_exact(&mut buf)?;
+                let b = Arc::new(Block::decode(Bytes::from(buf))?);
+                cache.lock().insert(cache_key, b.clone());
+                b
+            }
+        } else {
+            self.file.seek(SeekFrom::Start(meta.offset))?;
+            let mut buf = vec![0u8; meta.len as usize];
+            self.file.read_exact(&mut buf)?;
+            Arc::new(Block::decode(Bytes::from(buf))?)
+        };
+
+        self.current_entry_idx = match seek_key {
+            Some(k) => block.seek_to_key(k),
+            None => 0,
+        };
+        self.current_block_idx = block_idx + 1;
+        self.current_block = Some(block);
+        Ok(())
+    }
+}
+
+impl Iterator for SsTableIterator {
+    type Item = Result<(Bytes, Option<Bytes>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(block) = &self.current_block {
+                if self.current_entry_idx < block.len() {
+                    if let Some((key, val)) = block.get_entry(self.current_entry_idx) {
+                        self.current_entry_idx += 1;
+
+                        if let Some(end) = &self.end_bound {
+                            if key.as_ref() >= end.as_ref() {
+                                self.current_block = None;
+                                return None;
+                            }
+                        }
+
+                        return Some(Ok((key, val)));
+                    }
+                }
+            }
+
+            if self.current_block_idx >= self.block_metas.len() {
+                self.current_block = None;
+                return None;
+            }
+
+            if let Some(end) = &self.end_bound {
+                if self.block_metas[self.current_block_idx].first_key.as_ref() >= end.as_ref() {
+                    self.current_block = None;
+                    return None;
+                }
+            }
+
+            let next_idx = self.current_block_idx;
+            if let Err(e) = self.load_block_and_seek(next_idx, None) {
+                return Some(Err(e));
+            }
+        }
     }
 }
 
@@ -208,6 +430,21 @@ mod tests {
         assert_eq!(all.len(), 50);
         assert_eq!(all[0].0.as_ref(), b"key:0000");
         assert_eq!(all[49].0.as_ref(), b"key:0049");
+
+        // 3. Test SsTableIterator with ranges
+        // Range [key:0010, key:0020) -> should yield 10 items (key:0010 to key:0019)
+        let range_items: Result<Vec<(Bytes, Option<Bytes>)>> = reader
+            .iter_range(Some(b"key:0010"), Some(b"key:0020"))?
+            .collect();
+        let range_items = range_items?;
+        assert_eq!(range_items.len(), 10);
+        assert_eq!(range_items[0].0.as_ref(), b"key:0010");
+        assert_eq!(range_items[9].0.as_ref(), b"key:0019");
+
+        // Full range iterator
+        let full_iter_items: Result<Vec<(Bytes, Option<Bytes>)>> = reader.iter()?.collect();
+        let full_iter_items = full_iter_items?;
+        assert_eq!(full_iter_items.len(), 50);
 
         Ok(())
     }
