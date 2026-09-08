@@ -1,0 +1,12 @@
+[package]
+name = "lsm-tree"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1.6"
+crc32fast = "1.4"
+crossbeam-skiplist = "0.1" # Or write a pure Skip-List from scratch
+parking_lot = "0.12"
+tempfile = "3.10"
+thiserror = "1.0"
