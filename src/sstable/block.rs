@@ -67,6 +67,51 @@ impl Block {
         self.get_key(0)
     }
 
+    /// Retrieves the (key, value_or_tombstone) entry at index `idx`.
+    pub fn get_entry(&self, idx: usize) -> Option<(Bytes, Option<Bytes>)> {
+        let offset = *self.offsets.get(idx)? as usize;
+        let mut cursor = &self.data[offset..];
+        if cursor.len() < 7 {
+            return None;
+        }
+        let key_len = cursor.get_u16() as usize;
+        let val_len = cursor.get_u32() as usize;
+        let is_tombstone = cursor.get_u8() == 1;
+
+        if cursor.len() < key_len + val_len {
+            return None;
+        }
+
+        let key = self.data.slice(offset + 7..offset + 7 + key_len);
+        let val = if is_tombstone {
+            None
+        } else {
+            let val_start = offset + 7 + key_len;
+            Some(self.data.slice(val_start..val_start + val_len))
+        };
+        Some((key, val))
+    }
+
+    /// Finds the first entry index in this block where `key >= target_key`.
+    pub fn seek_to_key(&self, target_key: &[u8]) -> usize {
+        if self.offsets.is_empty() {
+            return 0;
+        }
+        let mut low = 0;
+        let mut high = self.offsets.len();
+
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let mid_key = self.get_key(mid).unwrap_or_default();
+            if mid_key.as_ref() < target_key {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
+    }
+
     /// Looks up a key within the block using binary search over the offset index.
     /// Returns:
     /// - `Some(Some(value))` if found with active value
@@ -206,7 +251,18 @@ mod tests {
 
         // Missing key
         assert_eq!(block.get(b"key:03"), None);
-        assert_eq!(block.get(b"key:25"), None);
+        // Verify get_entry
+        assert_eq!(block.get_entry(0), Some((Bytes::from("key:01"), Some(Bytes::from("val:01")))));
+        assert_eq!(block.get_entry(2), Some((Bytes::from("key:10"), None))); // Tombstone
+        assert_eq!(block.get_entry(4), None);
+
+        // Verify seek_to_key
+        assert_eq!(block.seek_to_key(b"key:00"), 0);
+        assert_eq!(block.seek_to_key(b"key:01"), 0);
+        assert_eq!(block.seek_to_key(b"key:03"), 1); // Points to key:05
+        assert_eq!(block.seek_to_key(b"key:05"), 1);
+        assert_eq!(block.seek_to_key(b"key:06"), 2); // Points to key:10
+        assert_eq!(block.seek_to_key(b"key:30"), 4); // Out of bounds (past last key)
 
         Ok(())
     }
